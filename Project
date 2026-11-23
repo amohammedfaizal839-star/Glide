@@ -1,0 +1,274 @@
+GEMINI_API_KEY="your-gemini-key"
+GROQ_API_KEY="your-groq-key"
+JWT_SECRET="your-random-32-byte-hex"
+Cd /mnt/user-data/outputs/google-helps
+
+cat > public/app.js <<'EOF1'
+const $ = s => document.querySelector(s);
+const token = () => localStorage.getItem('gh_token');
+let convId = null, mode = 'register', attached = null, refCode = '', cfg = { daily: 20, cost: { chat: 1, image: 3 } };
+
+async function api(path, body, method) {
+  const r = await fetch('/api/' + path, {
+    method: method || (body ? 'POST' : 'GET'),
+    headers: { 'Content-Type': 'application/json', ...(token() && { Authorization: 'Bearer ' + token() }) },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  const j = await r.json().catch(() => ({}));
+  if (r.status === 401 && token()) { localStorage.removeItem('gh_token'); location.reload(); }
+  if (!r.ok) throw new Error(j.error || 'Something went wrong. Try again.');
+  return j;
+}
+
+const setTheme = t => { document.documentElement.dataset.theme = t; localStorage.setItem('gh_theme', t); };
+setTheme(localStorage.getItem('gh_theme') || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'));
+document.querySelectorAll('.theme').forEach(b => b.onclick = () => setTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'));
+
+const esc = s => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+function md(text) {
+  return text.split('```').map((p, i) => {
+    if (i % 2) {
+      const nl = p.indexOf('\n');
+      const lang = (nl < 0 ? '' : p.slice(0, nl)).trim().replace(/[^\w+-]/g, '');
+      return `<div class="code"><div class="bar"><span>${lang || 'code'}</span><button class="copy">Copy</button></div><pre><code class="language-${lang}">${esc(nl < 0 ? p : p.slice(nl + 1))}</code></pre></div>`;
+    }
+    return esc(p).replace(/`([^`\n]+)`/g, '<code>$1</code>').replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>').replace(/\n/g, '<br>');
+  }).join('');
+}
+
+function addMsg(role, text) {
+  const log = $('#log');
+  log.querySelector('.starters')?.remove();
+  const el = document.createElement('div');
+  el.className = 'msg ' + role;
+  if (role === 'assistant') el.innerHTML = md(text); else el.textContent = text;
+  log.append(el);
+  if (window.hljs) el.querySelectorAll('pre code').forEach(c => hljs.highlightElement(c));
+  log.scrollTop = log.scrollHeight;
+  return el;
+}
+$('#log').addEventListener('click', e => {
+  if (e.target.classList.contains('copy')) {
+    navigator.clipboard.writeText(e.target.closest('.code').querySelector('code').textContent);
+    e.target.textContent = 'Copied';
+    setTimeout(() => e.target.textContent = 'Copy', 1500);
+  }
+});
+
+const STARTERS = ['Fix this error: TypeError: x is not a function', 'Make a to-do list web page with HTML, CSS and JavaScript', 'Explain what an API is, like I am new to coding', 'Write 5 short video ideas about healthy cooking'];
+function newChat() {
+  convId = null; clearAttach(); $('#log').textContent = '';
+  const d = document.createElement('div'); d.className = 'starters';
+  d.innerHTML = '<p>Try one of these, or ask anything:</p>';
+  STARTERS.forEach(t => { const b = document.createElement('button'); b.textContent = t; b.onclick = () => { $('#input').value = t; $('#input').focus(); }; d.append(b); });
+  $('#log').append(d); $('#side').classList.remove('open');
+}
+$('#newChat').onclick = () => { newChat(); loadHistory(); };
+
+const setCredits = n => $('#credits').textContent = n + ' credits left today';
+
+async function loadHistory() {
+  const { items } = await api('conversations');
+  const h = $('#hist'); h.textContent = '';
+  items.forEach(c => {
+    const row = document.createElement('div'); if (c.id === convId) row.className = 'on';
+    const t = document.createElement('button'); t.className = 't'; t.textContent = c.title; t.onclick = () => openConv(c.id);
+    const x = document.createElement('button'); x.className = 'x'; x.textContent = '×'; x.setAttribute('aria-label', 'Delete chat');
+    x.onclick = async () => { await api('conversations/' + c.id, null, 'DELETE'); if (convId === c.id) newChat(); loadHistory(); };
+    row.append(t, x); h.append(row);
+  });
+}
+async function openConv(id) {
+  try {
+    const { messages } = await api('conversations/' + id);
+    convId = id; $('#log').textContent = ''; messages.forEach(m => addMsg(m.role, m.content));
+    showTab('chat'); $('#side').classList.remove('open'); loadHistory();
+  } catch (e) { addMsg('error', e.message); }
+}
+
+function speak(t) {
+  if (!$('#speak').checked || !('speechSynthesis' in window)) return;
+  speechSynthesis.cancel();
+  speechSynthesis.speak(new SpeechSynthesisUtterance(t.replace(/```[\s\S]*?```/g, ' code block. ')));
+}
+
+function clearAttach() { attached = null; $('#chip').hidden = true; $('#file').value = ''; }
+$('#attach').onclick = () => $('#file').click();
+$('#file').onchange = e => {
+  const f = e.target.files[0]; if (!f) return;
+  const rd = new FileReader();
+  rd.onload = () => { attached = { name: f.name, body: String(rd.result).slice(0, 10000) }; $('#chip').textContent = 'Attached: ' + f.name + ' (first 10,000 characters). Tap + to replace.'; $('#chip').hidden = false; };
+  rd.readAsText(f);
+};
+
+async function send() {
+  const box = $('#input'); let text = box.value.trim();
+  if (!text && !attached) return;
+  const shown = text + (attached ? '\n[Attached: ' + attached.name + ']' : '');
+  if (attached) text += '\n\n[File: ' + attached.name + ']\n' + attached.body;
+  box.value = ''; clearAttach(); addMsg('user', shown);
+  const wait = addMsg('assistant', '…'); wait.classList.add('wait'); $('#send').disabled = true;
+  try {
+    const j = await api('chat', { message: text, model: $('#model').value, conversationId: convId });
+    convId = j.conversationId; wait.remove(); addMsg('assistant', j.reply); setCredits(j.credits); loadHistory(); speak(j.reply);
+  } catch (e) { wait.remove(); addMsg('error', e.message); }
+  $('#send').disabled = false;
+}
+$('#send').onclick = send;
+$('#input').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey && matchMedia('(pointer:fine)').matches) { e.preventDefault(); send(); } });
+
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+if (!SR) $('#mic').hidden = true;
+else {
+  const rec = new SR(); rec.lang = navigator.language || 'en-US';
+  rec.onresult = e => { $('#input').value += (($('#input').value && ' ') + e.results[0][0].transcript); };
+  rec.onend = () => $('#mic').classList.remove('on');
+  rec.onerror = () => $('#mic').classList.remove('on');
+  $('#mic').onclick = () => { try { rec.start(); $('#mic').classList.add('on'); } catch { rec.stop(); } };
+}
+
+function showTab(t) {
+  document.querySelectorAll('.tab').forEach(b => b.classList.toggle('on', b.dataset.tab === t));
+  $('#chat').hidden = t !== 'chat'; $('#image').hidden = t !== 'image';
+}
+document.querySelectorAll('.tab').forEach(b => b.onclick = () => showTab(b.dataset.tab));
+$('#menu').onclick = () => $('#side').classList.toggle('open');
+
+$('#gen').onclick = async () => {
+  const prompt = $('#prompt').value.trim(); if (!prompt) return;
+  $('#gen').disabled = true; $('#gen').textContent = 'Creating…';
+  try {
+    const j = await api('image', { prompt });
+    const fig = document.createElement('figure'), img = new Image(), a = document.createElement('a');
+    img.src = j.image; img.alt = prompt; a.href = j.image; a.download = 'google-helps.png'; a.textContent = 'Download';
+    fig.append(img, a); $('#imgs').prepend(fig); setCredits(j.credits);
+  } catch (e) { alert(e.message); }
+  $('#gen').disabled = false; $('#gen').textContent = 'Create image';
+};
+
+$('#invite').onclick = async () => {
+  await navigator.clipboard.writeText(location.origin + '/?ref=' + refCode);
+  $('#invite').textContent = 'Link copied'; setTimeout(() => $('#invite').textContent = 'Copy invite link (+10 credits per friend)', 1800);
+};
+$('#fbBtn').onclick = () => $('#fb').showModal();
+$('#fbForm').addEventListener('submit', async e => {
+  if (e.submitter?.value !== 'ok') return;
+  try { await api('feedback', { message: $('#fbText').value }); $('#fbText').value = ''; } catch (err) { alert(err.message); }
+});
+$('#logout').onclick = () => { localStorage.removeItem('gh_token'); location.reload(); };
+
+$('#authSwap').onclick = () => {
+  mode = mode === 'register' ? 'login' : 'register';
+  $('#authTitle').textContent = mode === 'register' ? 'Create your free account' : 'Sign in';
+  $('#authBtn').textContent = mode === 'register' ? 'Create account' : 'Sign in';
+  $('#authSwap').textContent = mode === 'register' ? 'I already have an account' : 'Create a new account';
+  $('#pass').autocomplete = mode === 'register' ? 'new-password' : 'current-password'; $('#authErr').textContent = '';
+};
+$('#auth').addEventListener('submit', async e => {
+  e.preventDefault(); $('#authErr').textContent = ''; $('#authBtn').disabled = true;
+  try {
+    const { token: t } = await api(mode, { email: $('#email').value, password: $('#pass').value, ref: new URLSearchParams(location.search).get('ref') || '' });
+    localStorage.setItem('gh_token', t); enter();
+  } catch (err) { $('#authErr').textContent = err.message; }
+  $('#authBtn').disabled = false;
+});
+
+async function enter() {
+  $('#landing').hidden = true; $('#app').hidden = false; newChat();
+  $('#imgcost').textContent = cfg.cost.image;
+  try {
+    const [me, models] = await Promise.all([api('me'), api('models')]);
+    refCode = me.ref_code; setCredits(me.credits);
+    models.items.forEach(m => $('#model').add(new Option(m.label, m.id)));
+    if (!models.items.length) addMsg('error', 'No AI model is set up on the server. Add GEMINI_API_KEY or GROQ_API_KEY to .env and restart.');
+    loadHistory();
+  } catch (e) { addMsg('error', e.message); }
+}
+
+(async () => {
+  try { cfg = await api('config'); } catch {}
+  $('#limits').textContent = `${cfg.daily} free credits every day. A chat message costs ${cfg.cost.chat}; an image costs ${cfg.cost.image}.`;
+  if (token()) enter();
+})();
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js');
+EOF1
+
+cat > README.md <<'EOF1'
+# Google Helps
+
+Node/Express backend + SQLite + a mobile-first website (installable PWA). The Android app is the same site packaged as a Trusted Web Activity, so there is one codebase to maintain.
+
+## What works
+- Accounts (bcrypt + JWT), saved chat history, daily free credits, invite links (+10 credits each)
+- Chat with Gemini and/or Llama via Groq (free tiers). A model shows up only if its key is set.
+- Code answers with syntax highlighting and Copy buttons; text/code file attach (first 10,000 characters)
+- Image generation (Pollinations, free, no key)
+- Voice input and read-aloud (browser Web Speech; support varies by browser)
+- Dark/light mode, feedback form, rate limiting, helmet security headers, API keys stay on the server
+
+## Not built (so there are no fake buttons)
+- Video generation: no reliable free text-to-video API exists. Add a paid one later; the credit system is ready for it.
+- Paid plans: needs Google Play Billing (Android) and a web payment provider. Credits and limits are shown, but there is no Upgrade button yet.
+- Code editor / app-builder workspace and saved "projects": chat history is the only saved work for now.
+
+## Run it
+1. `cp .env.example .env`, set `JWT_SECRET` (`node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`).
+2. Get free keys: Gemini at https://aistudio.google.com/apikey, Groq at https://console.groq.com. Paste one or both into `.env`. Check the providers' docs for current model names and free limits.
+3. `npm install && npm start`, then open http://localhost:3000
+
+## Test it
+```
+curl localhost:3000/health
+curl -X POST localhost:3000/api/register -H 'Content-Type: application/json' -d '{"email":"a@b.co","password":"password123"}'
+# copy the token, then:
+curl -X POST localhost:3000/api/chat -H 'Content-Type: application/json' -H "Authorization: Bearer TOKEN" -d '{"message":"Say hi"}'
+```
+Rate limit check: send 21 bad logins in 15 minutes and you should get HTTP 429. If chat returns 502, read the server log: it prints the provider's error (bad key, wrong model name, quota).
+
+## Deploy
+SQLite needs a disk that survives restarts. Free hosts that wipe the disk will delete your users. Use a small VPS (roughly $5/month) or a host with a persistent disk. Steps on a VPS: install Node 20+, copy the folder, create `.env`, run with `pm2 start server.js`, put Caddy or Nginx in front for HTTPS. HTTPS is required for the PWA, the microphone, and Play. Back up `data.db` regularly. If you outgrow SQLite, move to Postgres.
+
+## Publish on Google Play
+1. Deploy to your real HTTPS domain first.
+2. Go to https://www.pwabuilder.com, enter your URL, choose Android, and download the package. It contains your signing key. Back it up.
+3. Put the `assetlinks.json` it gives you at `https://YOUR-DOMAIN/.well-known/assetlinks.json` (add a `public/.well-known` folder; Express serves dotfolders only with `dotfiles: 'allow'` in `express.static`).
+4. Create a Play Console account (one-time fee) and upload the .aab. New personal accounts currently must run a closed test with testers before production; check Play's current rules.
+5. Required: privacy policy URL, Data safety form, content rating. Say that chat text is sent to Google (Gemini) and/or Groq, and that image prompts go to Pollinations. Free-tier terms can allow providers to use inputs to improve their products, so read them and disclose it.
+6. Name warning: "Google" in an app name can get rejected or taken down for implying affiliation. Consider a different name before you publish.
+7. Store listing: put the main keyword in the title ("... AI Code Fixer & Chat"), a clear first line of the description, real screenshots.
+
+## Growth hooks already in the code
+Landing page text for SEO (title, description, Open Graph), invite links, daily credits, starter prompts for beginners, feedback form. Add a sitemap and a privacy page next.
+EOF1
+
+python3 - <<'EOF1'
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    for n in (192, 512):
+        im = Image.new('RGB', (n, n)); px = im.load()
+        for y in range(n):
+            for x in range(n):
+                t = (x + y) / (2 * n)
+                px[x, y] = (int(79 + 76 * t), int(134 - 27 * t), int(255 - 0 * t))
+        d = ImageDraw.Draw(im)
+        try: f = ImageFont.truetype('DejaVuSans-Bold.ttf', int(n * .55))
+        except Exception: f = ImageFont.load_default(size=int(n * .55))
+        d.text((n / 2, n / 2), 'G', fill='white', font=f, anchor='mm')
+        im.save(f'public/icon-{n}.png')
+    print('icons ok')
+except Exception as e:
+    print('icons skipped:', e)
+EOF1
+
+command -v node >/dev/null && { node --check server.js && node --check public/app.js && node --check public/sw.js && echo "syntax ok"; } || echo "node not available for syntax check"
+python3 -c "import json;json.load(open('public/manifest.webmanifest'));print('manifest ok')"
+python3 - <<'EOF1'
+import zipfile, os
+root = '/mnt/user-data/outputs/google-helps'
+with zipfile.ZipFile('/mnt/user-data/outputs/google-helps.zip', 'w', zipfile.ZIP_DEFLATED) as z:
+    for d, _, fs in os.walk(root):
+        for f in fs:
+            p = os.path.join(d, f); z.write(p, os.path.join('google-helps', os.path.relpath(p, root)))
+print('zipped')
+EOF1
+ls public.
